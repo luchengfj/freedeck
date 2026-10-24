@@ -39,8 +39,15 @@ def _is_vpn_interface(name: str) -> bool:
 
 def _get_ip_from_ip_cmd() -> str | None:
     """优先通过 ip 命令读取局域网 IPv4。"""
-    ip_bin = shutil.which("ip") or "/sbin/ip" or "/usr/sbin/ip"
-    if not os.path.exists(ip_bin):
+    ip_bin = shutil.which("ip")
+    if not ip_bin:
+        # 逐个尝试固定路径（原写法 "/sbin/ip" or "/usr/sbin/ip" 恒取前者，
+        # 导致 /usr/sbin/ip 永远不会被尝试）。
+        for candidate in ("/sbin/ip", "/usr/sbin/ip"):
+            if os.path.exists(candidate):
+                ip_bin = candidate
+                break
+    if not ip_bin or not os.path.exists(ip_bin):
         return None
 
     try:

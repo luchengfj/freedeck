@@ -202,7 +202,12 @@ def _format_hours_value(hours_value: Any) -> str:
 
 def _disk_free_bytes(path: str) -> int:
     """获取目标目录所在分区的可用空间。"""
-    target = os.path.realpath(os.path.expanduser(str(path or "").strip()))
+    # 先校验原始输入：os.path.realpath("") 返回当前工作目录而不是空串，
+    # 直接 realpath 无法识别空路径。
+    raw = str(path or "").strip()
+    if not raw:
+        raise ValueError("目录无效")
+    target = os.path.realpath(os.path.expanduser(raw))
     if not target:
         raise ValueError("目录无效")
     os.makedirs(target, exist_ok=True)
@@ -1361,6 +1366,7 @@ class TianyiService:
                     expires_at=expires_at,
                     diagnostics=poll_diag,
                 )
+                await self._close_qr_login_context_locked()
                 return dict(self._qr_login_state)
 
             if status_code in QR_STATUS_WAITING:
@@ -2505,7 +2511,28 @@ class TianyiService:
                     message=f"正在拉取版本列表 {index}/{total}",
                     progress=progress,
                 )
-        finally:
+        except asyncio.CancelledError:
+            await self._set_cloud_save_restore_state(
+                stage="failed",
+                running=False,
+                progress=100.0,
+                message="云存档版本列表拉取已取消",
+                reason="cancelled",
+                diagnostics={"games": len(grouped), "details": diagnostics},
+            )
+            raise
+        except Exception as exc:
+            config.logger.warning("List cloud save restore options failed: %s", exc)
+            await self._set_cloud_save_restore_state(
+                stage="failed",
+                running=False,
+                progress=100.0,
+                message=f"云存档版本列表拉取失败：{exc}",
+                reason="list_failed",
+                diagnostics={"games": len(grouped), "details": diagnostics},
+            )
+            raise
+        else:
             await self._set_cloud_save_restore_state(
                 stage="completed",
                 running=False,
@@ -2663,6 +2690,37 @@ class TianyiService:
         )
 
         temp_dir = str(bundle.get("temp_dir", "") or "")
+        try:
+            return await self._build_cloud_save_restore_plan(
+                bundle=bundle,
+                temp_dir=temp_dir,
+                cookie=cookie,
+                normalized_game_id=normalized_game_id,
+                normalized_game_title=normalized_game_title,
+                normalized_game_key=normalized_game_key,
+                normalized_version=normalized_version,
+                selected_entry_ids=selected_entry_ids,
+                target_dir=target_dir,
+            )
+        except BaseException:
+            # 计划构建中途异常时清理已下载解压的临时目录，
+            # 否则数百 MB 的压缩包会永久遗留在系统临时目录。
+            self._cleanup_cloud_save_temp_paths([temp_dir])
+            raise
+
+    async def _build_cloud_save_restore_plan(
+        self,
+        *,
+        bundle: Dict[str, Any],
+        temp_dir: str,
+        cookie: str,
+        normalized_game_id: str,
+        normalized_game_title: str,
+        normalized_game_key: str,
+        normalized_version: str,
+        selected_entry_ids: Optional[Sequence[str]],
+        target_dir: str,
+    ) -> Dict[str, Any]:
         extract_dir = str(bundle.get("extract_dir", "") or "")
         manifest = dict(bundle.get("manifest") or {})
         manifest_playtime = self._extract_manifest_playtime_payload(manifest)
@@ -2849,6 +2907,10 @@ class TianyiService:
 
         async with self._cloud_save_restore_lock:
             plan = dict(self._cloud_save_restore_plan or {})
+            if plan and str(plan.get("plan_id", "") or "").strip() == normalized_plan_id:
+                # 原子取出计划：并发重复执行同一计划时，后到者直接失败，
+                # 避免执行中一方清理临时目录导致另一方的复制源丢失。
+                self._cloud_save_restore_plan = {}
 
         if not plan or str(plan.get("plan_id", "") or "").strip() != normalized_plan_id:
             raise TianyiApiError("恢复计划不存在或已过期，请重新规划")
@@ -3233,7 +3295,7 @@ class TianyiService:
                 if not rel_path:
                     rel_path = str(item.get("relative_path", "") or "").strip().replace("\\", "/").strip("/")
                 abs_path = os.path.realpath(os.path.join(extract_root, rel_path)) if rel_path else extract_root
-                if not abs_path.startswith(extract_root):
+                if not (abs_path == extract_root or abs_path.startswith(extract_root + os.sep)):
                     continue
                 if not os.path.exists(abs_path):
                     continue
@@ -3897,7 +3959,7 @@ class TianyiService:
             entry_name = str(entry.get("entry_name", "") or entry_id).strip() or entry_id
             rel_path = str(entry.get("archive_rel_path", "") or "").strip().replace("\\", "/").strip("/")
             entry_root = os.path.realpath(os.path.join(extract_root, rel_path)) if rel_path else extract_root
-            if not entry_root.startswith(extract_root):
+            if not (entry_root == extract_root or entry_root.startswith(extract_root + os.sep)):
                 continue
             if not os.path.exists(entry_root):
                 continue
@@ -3923,7 +3985,7 @@ class TianyiService:
                         src_file = os.path.join(dirpath, filename)
                         rel_file = os.path.relpath(src_file, entry_root)
                         dst_file = os.path.realpath(os.path.join(entry_target_root, rel_file))
-                        if not dst_file.startswith(entry_target_root):
+                        if not (dst_file == entry_target_root or dst_file.startswith(entry_target_root + os.sep)):
                             continue
                         pairs_for_entry.append((src_file, dst_file))
 
@@ -4018,7 +4080,12 @@ class TianyiService:
                     rel_path = os.path.relpath(normalized_source, working_dir).replace("\\", "/")
                 except Exception:
                     rel_path = os.path.basename(normalized_source.rstrip("/\\"))
-                rel_path = str(rel_path or "").replace("\\", "/").strip("./")
+                # 只去掉 "./" 前缀与两端的 "/"。不能用 strip("./")：
+                # 它会剥掉所有点号，把 ".local/share" 这类隐藏目录破坏成 "local/share"。
+                rel_path = str(rel_path or "").replace("\\", "/")
+                while rel_path.startswith("./"):
+                    rel_path = rel_path[2:]
+                rel_path = rel_path.strip("/")
                 if not rel_path:
                     rel_path = os.path.basename(normalized_source.rstrip("/\\"))
                 entry_name = os.path.basename(normalized_source.rstrip("/\\")).strip() or f"entry_{idx}"
@@ -4246,9 +4313,6 @@ class TianyiService:
                     progress=progress,
                     results=results,
                 )
-
-                if cancelled:
-                    break
         except asyncio.CancelledError:
             cancelled = True
             final_stage = "failed"
@@ -4272,6 +4336,14 @@ class TianyiService:
         finally:
             finished_at = _now_wall_ts()
             total_games = len(candidates)
+            # 只有成功完成才显示 100%；失败/取消时保持已处理比例，
+            # 避免出现"失败但进度 100%"的矛盾状态。
+            if final_stage == "completed":
+                final_progress = 100.0
+            elif total_games > 0:
+                final_progress = (float(len(results)) / float(total_games)) * 100.0
+            else:
+                final_progress = 0.0
             final_payload = {
                 "stage": final_stage,
                 "reason": final_reason,
@@ -4308,7 +4380,7 @@ class TianyiService:
                 uploaded=uploaded,
                 skipped=skipped,
                 failed=failed,
-                progress=100.0 if total_games <= 0 else (float(len(results)) / float(total_games)) * 100.0,
+                progress=final_progress,
                 results=results,
                 diagnostics={
                     "collect": collect_diagnostics,
@@ -4682,48 +4754,58 @@ class TianyiService:
         target_dir = str(plan.get("download_dir", "")).strip()
 
         created: List[TianyiTaskRecord] = []
-        for file_item in plan.get("files", []):
-            if not isinstance(file_item, dict):
-                continue
-            file_id = str(file_item.get("file_id", "")).strip()
-            name = str(file_item.get("name", "")).strip() or f"file-{file_id}"
-            if not file_id:
-                continue
+        try:
+            for file_item in plan.get("files", []):
+                if not isinstance(file_item, dict):
+                    continue
+                file_id = str(file_item.get("file_id", "")).strip()
+                name = str(file_item.get("name", "")).strip() or f"file-{file_id}"
+                if not file_id:
+                    continue
 
-            direct_url = await fetch_download_url(
-                self.store.login.cookie,
-                access_token,
-                share_id,
-                file_id,
-            )
-            gid = await self.aria2.add_uri(
-                direct_url=direct_url,
-                cookie=self.store.login.cookie,
-                download_dir=target_dir,
-                out_name=name,
-                split=split,
-            )
-            now = _now_wall_ts()
-            created.append(
-                TianyiTaskRecord(
-                    task_id=str(uuid.uuid4()),
-                    gid=gid,
-                    game_id=game_id,
-                    game_title=game_title,
-                    share_code=share_code,
-                    share_id=share_id,
-                    file_id=file_id,
-                    file_name=name,
-                    download_dir=target_dir,
-                    local_path=os.path.join(target_dir, name),
-                    status="waiting",
-                    progress=0.0,
-                    speed=0,
-                    openpath=open_path,
-                    created_at=now,
-                    updated_at=now,
+                direct_url = await fetch_download_url(
+                    self.store.login.cookie,
+                    access_token,
+                    share_id,
+                    file_id,
                 )
-            )
+                gid = await self.aria2.add_uri(
+                    direct_url=direct_url,
+                    cookie=self.store.login.cookie,
+                    download_dir=target_dir,
+                    out_name=name,
+                    split=split,
+                )
+                now = _now_wall_ts()
+                created.append(
+                    TianyiTaskRecord(
+                        task_id=str(uuid.uuid4()),
+                        gid=gid,
+                        game_id=game_id,
+                        game_title=game_title,
+                        share_code=share_code,
+                        share_id=share_id,
+                        file_id=file_id,
+                        file_name=name,
+                        download_dir=target_dir,
+                        local_path=os.path.join(target_dir, name),
+                        status="waiting",
+                        progress=0.0,
+                        speed=0,
+                        openpath=open_path,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+        except Exception:
+            # 中途失败时回滚已提交给 aria2 的任务，避免产生
+            # 没有记录、面板不可见也无法暂停/删除的孤儿下载。
+            for record in created:
+                try:
+                    await self.aria2.remove(record.gid)
+                except Exception:
+                    config.logger.warning("Rollback aria2 task failed: gid=%s", record.gid)
+            raise
         return created
 
     async def refresh_tasks(self, sync_aria2: bool = True, persist: bool = True) -> List[Dict[str, Any]]:
@@ -4827,10 +4909,18 @@ class TianyiService:
         return _task_to_view(task)
 
     async def resume_task(self, task_id: str) -> Dict[str, Any]:
-        """恢复任务。"""
+        """恢复任务。
+
+        error 状态的任务（常见于断网后天翼直链过期导致 403）
+        直接 aria2.unpause 会失败，需要重新获取直链并重建下载任务。
+        """
         task = self._find_task(task_id)
         if task is None:
             raise ValueError("任务不存在")
+
+        if str(task.status or "").lower() == "error":
+            return await self._rebuild_task_with_fresh_url(task)
+
         await self.aria2.resume(task.gid)
         task.status = "active"
         task.updated_at = _now_wall_ts()
@@ -4838,18 +4928,98 @@ class TianyiService:
         self._invalidate_panel_cache(tasks=True)
         return _task_to_view(task)
 
-    async def remove_task(self, task_id: str) -> Dict[str, Any]:
-        """移除任务。"""
+    async def _rebuild_task_with_fresh_url(self, task: TianyiTaskRecord) -> Dict[str, Any]:
+        """重新获取直链并重建 aria2 任务（用于断线/直链过期的恢复重试）。"""
+        share_id = str(task.share_id or "").strip()
+        file_id = str(task.file_id or "").strip()
+        if not share_id or not file_id:
+            raise TianyiApiError("任务缺少分享信息，无法恢复，请删除后重新下载")
+
+        await self.aria2.ensure_running()
+        access_token = await fetch_access_token(self.store.login.cookie)
+        direct_url = await fetch_download_url(
+            self.store.login.cookie,
+            access_token,
+            share_id,
+            file_id,
+        )
+
+        old_gid = str(task.gid or "")
+        new_gid = await self.aria2.add_uri(
+            direct_url=direct_url,
+            cookie=self.store.login.cookie,
+            download_dir=task.download_dir,
+            out_name=task.file_name,
+            split=self.store.settings.split_count,
+        )
+        if old_gid and old_gid != new_gid:
+            try:
+                await self.aria2.remove(old_gid)
+            except Exception:
+                config.logger.warning("Remove stale aria2 task failed: gid=%s", old_gid)
+
+        # aria2 开启了 continue=true，会基于已存在的分片文件断点续传，
+        # 进度以下一次 refresh_tasks 从 aria2 读取为准。
+        task.gid = new_gid
+        task.status = "waiting"
+        task.error_reason = ""
+        task.updated_at = _now_wall_ts()
+        self.store.save()
+        self._invalidate_panel_cache(tasks=True)
+        return _task_to_view(task)
+
+    async def remove_task(self, task_id: str, delete_files: bool = True) -> Dict[str, Any]:
+        """移除任务，并可选清理已下载的部分文件与 aria2 控制文件。"""
         task = self._find_task(task_id)
         if task is None:
             raise ValueError("任务不存在")
         await self.aria2.remove(task.gid)
+
+        deleted_files: List[str] = []
+        delete_warning = ""
+        if delete_files:
+            try:
+                deleted_files = self._delete_task_files(task)
+            except Exception as exc:
+                delete_warning = f"任务已移除，但清理文件失败：{exc}"
+                config.logger.warning("Delete task files failed: %s", exc)
+
         task.status = "removed"
         task.updated_at = _now_wall_ts()
         self._cleanup_tasks(self.store.tasks)
         self.store.save()
         self._invalidate_panel_cache(tasks=True)
-        return _task_to_view(task)
+        view = _task_to_view(task)
+        if deleted_files or delete_warning:
+            view = dict(view)
+            view["deleted_files"] = deleted_files
+            view["delete_warning"] = delete_warning
+        return view
+
+    def _delete_task_files(self, task: TianyiTaskRecord) -> List[str]:
+        """删除任务的半成品文件与 .aria2 控制文件，返回被删除的路径。"""
+        removed: List[str] = []
+        download_root = os.path.realpath(os.path.expanduser(str(task.download_dir or "").strip()))
+        if not download_root:
+            # 缺少下载目录信息时不做任何删除，避免误删任意路径。
+            return removed
+        download_root = download_root.rstrip(os.sep)
+
+        local_path = str(task.local_path or "").strip()
+        candidates = [local_path, f"{local_path}.aria2"] if local_path else []
+        for raw in candidates:
+            path = os.path.realpath(os.path.expanduser(raw))
+            # 只允许删除下载目录内的文件，防止误删系统路径。
+            if not path.startswith(download_root + os.sep):
+                continue
+            if not os.path.isfile(path):
+                continue
+            try:
+                os.remove(path)
+                removed.append(path)
+            except FileNotFoundError:
+                continue
+        return removed
 
     def _find_task(self, task_id: str) -> Optional[TianyiTaskRecord]:
         """查找任务对象。"""
@@ -4899,16 +5069,26 @@ class TianyiService:
         }
 
     def _find_installed_record(self, *, game_id: str = "", install_path: str = "") -> Optional[TianyiInstalledGame]:
-        """查找已安装游戏记录。"""
+        """查找已安装游戏记录。
+
+        同时提供 game_id 与 install_path 时优先精确匹配两者，
+        避免同 game_id 的其它记录抢先命中导致卸载删错目录。
+        """
         target_game_id = str(game_id or "").strip()
         target_install_path = os.path.realpath(os.path.expanduser(str(install_path or "").strip())) if install_path else ""
+        if not target_game_id and not target_install_path:
+            return None
+
+        fallback: Optional[TianyiInstalledGame] = None
         for record in self.store.installed_games:
             same_game = bool(target_game_id and str(record.game_id or "") == target_game_id)
             current_install_path = os.path.realpath(os.path.expanduser(str(record.install_path or "").strip()))
             same_path = bool(target_install_path and current_install_path == target_install_path)
-            if same_game or same_path:
+            if same_game and same_path:
                 return record
-        return None
+            if fallback is None and (same_game or same_path):
+                fallback = record
+        return fallback
 
     def _remove_installed_record_in_memory(
         self,
@@ -4919,12 +5099,20 @@ class TianyiService:
         """仅在内存中移除已安装记录，供持久化异常时回退。"""
         target_game_id = str(game_id or "").strip()
         target_install_path = os.path.realpath(os.path.expanduser(str(install_path or "").strip())) if install_path else ""
+        if not target_game_id and not target_install_path:
+            return None
+
+        fallback_idx: Optional[int] = None
         for idx, record in enumerate(list(self.store.installed_games)):
             same_game = bool(target_game_id and str(record.game_id or "") == target_game_id)
             current_path = os.path.realpath(os.path.expanduser(str(record.install_path or "").strip()))
             same_path = bool(target_install_path and current_path == target_install_path)
-            if same_game or same_path:
+            if same_game and same_path:
                 return self.store.installed_games.pop(idx)
+            if fallback_idx is None and (same_game or same_path):
+                fallback_idx = idx
+        if fallback_idx is not None:
+            return self.store.installed_games.pop(fallback_idx)
         return None
 
     def _can_remove_install_path(self, path: str) -> Tuple[bool, str]:

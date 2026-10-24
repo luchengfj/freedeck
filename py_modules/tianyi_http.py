@@ -256,9 +256,20 @@ async def handle_login_redirect(request: web.Request, plugin: Any) -> web.Respon
 async def handle_catalog(request: web.Request, plugin: Any) -> web.Response:
     """查询目录列表。"""
     try:
+        def _query_int(name: str, default: int) -> int:
+            # URL 中形如 ?page= 的空值会被 query.get 返回为 ""，
+            # 直接 int("") 会抛 ValueError，这里回退到默认值。
+            raw = str(request.query.get(name, "")).strip()
+            if not raw:
+                return default
+            try:
+                return int(raw)
+            except Exception:
+                return default
+
         query = str(request.query.get("q", "")).strip()
-        page = int(request.query.get("page", "1"))
-        page_size = int(request.query.get("page_size", request.query.get("pageSize", "0")))
+        page = _query_int("page", 1)
+        page_size = _query_int("page_size", _query_int("pageSize", 0))
         data = await _service(plugin).list_catalog(query, page, page_size)
         return _json_ok({"data": data})
     except Exception as exc:
@@ -484,11 +495,12 @@ async def handle_resume(request: web.Request, plugin: Any) -> web.Response:
 
 
 async def handle_remove(request: web.Request, plugin: Any) -> web.Response:
-    """移除任务。"""
+    """移除任务（默认同时清理半成品文件与 aria2 控制文件）。"""
     try:
         body = await request.json()
         task_id = str(body.get("task_id", "")).strip()
-        data = await _service(plugin).remove_task(task_id)
+        delete_files = bool(body.get("delete_files", True))
+        data = await _service(plugin).remove_task(task_id, delete_files=delete_files)
         return _json_ok({"data": data})
     except Exception as exc:
         return _json_error_from_exception(exc)

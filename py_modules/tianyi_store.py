@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
@@ -177,8 +178,18 @@ class TianyiStateStore:
         with self._lock:
             if not os.path.exists(self._state_file):
                 return
-            with open(self._state_file, "r", encoding="utf-8") as f:
-                raw = json.load(f)
+            try:
+                with open(self._state_file, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+                # 状态文件损坏（如断电截断）时不能让插件启动永久失败：
+                # 备份损坏文件后回退到默认空状态。
+                logging.getLogger("freedeck").warning("状态文件损坏，已重置为空状态: %s", exc)
+                try:
+                    os.replace(self._state_file, f"{self._state_file}.corrupt")
+                except Exception:
+                    pass
+                return
 
             login_raw = raw.get("login") if isinstance(raw, dict) else {}
             settings_raw = raw.get("settings") if isinstance(raw, dict) else {}
@@ -245,7 +256,9 @@ class TianyiStateStore:
     def save(self) -> None:
         """将状态写入磁盘。"""
         with self._lock:
-            os.makedirs(os.path.dirname(self._state_file), exist_ok=True)
+            state_dir = os.path.dirname(self._state_file)
+            if state_dir:
+                os.makedirs(state_dir, exist_ok=True)
             payload = {
                 "login": asdict(self.login),
                 "settings": asdict(self.settings),
@@ -254,41 +267,49 @@ class TianyiStateStore:
                 "cloud_save_last_result": dict(self.cloud_save_last_result or {}),
                 "cloud_save_restore_last_result": dict(self.cloud_save_restore_last_result or {}),
             }
-            tmp_path = f"{self._state_file}.tmp"
-            replace_error: Optional[BaseException] = None
 
-            try:
-                with open(tmp_path, "w", encoding="utf-8") as f:
-                    json.dump(payload, f, ensure_ascii=False, indent=2)
-            except Exception:
-                # 临时文件写入失败时直接回退到目标文件写入。
+            # 始终先写临时文件再原子替换。不能用 "w" 直接打开目标文件：
+            # 那会在写入前先截断原文件，磁盘满/IO 异常时会把整个状态文件清空。
+            replace_error: Optional[BaseException] = None
+            wrote_tmp = False
+            tmp_path = ""
+            for suffix in (".tmp", ".tmp2"):
+                tmp_path = f"{self._state_file}{suffix}"
+                try:
+                    with open(tmp_path, "w", encoding="utf-8") as f:
+                        json.dump(payload, f, ensure_ascii=False, indent=2)
+                    wrote_tmp = True
+                except Exception as exc:
+                    # 临时文件写入失败（多为磁盘满）：保留磁盘上的旧状态，换名重试。
+                    replace_error = exc
+                    continue
+
+                replace_error = None
+                for attempt in range(2):
+                    try:
+                        os.replace(tmp_path, self._state_file)
+                        return
+                    except Exception as exc:
+                        replace_error = exc
+                        # 某些环境会瞬时返回 "User canceled"，短暂重试一次。
+                        if attempt == 0:
+                            time.sleep(0.05)
+                # replace 失败时清理当前临时文件后尝试下一个。
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+
+            if wrote_tmp:
+                # 临时文件能写成功说明磁盘空间充足，rename 持续失败时
+                # 才回退为直接覆盖写入，避免调用链整体失败。
                 with open(self._state_file, "w", encoding="utf-8") as f:
                     json.dump(payload, f, ensure_ascii=False, indent=2)
                 return
 
-            for attempt in range(2):
-                try:
-                    os.replace(tmp_path, self._state_file)
-                    replace_error = None
-                    break
-                except Exception as exc:
-                    replace_error = exc
-                    # 某些环境会瞬时返回 "User canceled"，短暂重试一次。
-                    if attempt == 0:
-                        time.sleep(0.05)
-                        continue
-
-            if replace_error is None:
-                return
-
-            # rename 仍失败时回退为直接覆盖写入，避免调用链整体失败。
-            with open(self._state_file, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except Exception:
-                pass
+            if replace_error is not None:
+                raise replace_error
 
     def set_login(self, cookie: str, user_account: str) -> None:
         """更新登录态。"""
@@ -415,12 +436,18 @@ class TianyiStateStore:
             return None
 
         with self._lock:
+            fallback_idx: Optional[int] = None
             for idx, current in enumerate(self.installed_games):
                 same_game = bool(target_game_id and current.game_id == target_game_id)
                 same_path = bool(target_install_path and current.install_path == target_install_path)
-                if not same_game and not same_path:
-                    continue
-                removed = self.installed_games.pop(idx)
+                if same_game and same_path:
+                    removed = self.installed_games.pop(idx)
+                    self.save()
+                    return removed
+                if fallback_idx is None and (same_game or same_path):
+                    fallback_idx = idx
+            if fallback_idx is not None:
+                removed = self.installed_games.pop(fallback_idx)
                 self.save()
                 return removed
         return None

@@ -234,7 +234,8 @@ def _get_json_value(payload: Dict[str, object], *keys: str) -> str:
             for raw_key, raw_value in current.items():
                 key_name = str(raw_key).strip().lower()
                 if key_name in target_keys:
-                    text = str(raw_value or "").strip()
+                    # 与顶层分支保持一致：0/False 是有效值，不能被 or 短路吞掉。
+                    text = "" if raw_value is None else str(raw_value).strip()
                     if text:
                         return text
                 if isinstance(raw_value, (dict, list)):
@@ -1497,22 +1498,57 @@ async def resolve_share(share_url: str, cookie: str) -> ResolvedShare:
                     diagnostics={"share_code": share_code, "share_url": share_url, "attempts": attempts},
                 ) from first_error
 
-        file_list_ao = _find_nested_value(list_payload, "fileListAO")
-        rows: object = file_list_ao.get("fileList") if isinstance(file_list_ao, dict) else None
-        if not isinstance(rows, list):
-            rows = _find_nested_value(list_payload, "fileList", "files", "rows", "list")
-        files: List[ResolvedFile] = []
-        if isinstance(rows, list):
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                file_id = _get_json_value(row, "id", "fileId")
-                if not file_id:
-                    continue
-                name = _get_json_value(row, "name", "fileName") or f"file-{file_id}"
-                size = _parse_int(row.get("size", row.get("fileSize", 0)), 0)
-                folder = str(row.get("isFolder", "")).lower() in {"1", "true"}
-                files.append(ResolvedFile(file_id=file_id, name=name, size=size, is_folder=folder))
+        def _extract_share_files(payload: Dict[str, object]) -> Tuple[List[ResolvedFile], int]:
+            """从 listShareDir 响应提取文件清单与总数。"""
+            file_list_ao = _find_nested_value(payload, "fileListAO")
+            rows: object = file_list_ao.get("fileList") if isinstance(file_list_ao, dict) else None
+            if not isinstance(rows, list):
+                rows = _find_nested_value(payload, "fileList", "files", "rows", "list")
+            page_files: List[ResolvedFile] = []
+            if isinstance(rows, list):
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    file_id = _get_json_value(row, "id", "fileId")
+                    if not file_id:
+                        continue
+                    name = _get_json_value(row, "name", "fileName") or f"file-{file_id}"
+                    size = _parse_int(row.get("size", row.get("fileSize", 0)), 0)
+                    folder = str(row.get("isFolder", "")).lower() in {"1", "true"}
+                    page_files.append(ResolvedFile(file_id=file_id, name=name, size=size, is_folder=folder))
+            total = 0
+            if isinstance(file_list_ao, dict):
+                total = max(0, _parse_int(file_list_ao.get("count", 0), 0))
+            return page_files, total
+
+        files, total_count = _extract_share_files(list_payload)
+
+        # 分页拉全部分享文件：listShareDir 单页最多 60 条，
+        # 不翻页会导致分卷包第 61 个之后的文件被静默丢弃。
+        page_size = max(1, _parse_int(params.get("pageSize", "60"), 60) or 60)
+        if files and total_count > len(files):
+            max_pages = min(100, (total_count + page_size - 1) // page_size)
+            for page_num in range(2, max_pages + 1):
+                next_params = dict(params)
+                next_params["pageNum"] = str(page_num)
+                try:
+                    next_payload = await _request_list_payload(next_params, step_name=f"list_share_dir_page{page_num}")
+                except TianyiApiError as exc:
+                    # 某一页失败时保留已取得的文件，不中断整体解析。
+                    _append_attempt(
+                        attempts,
+                        step=f"list_share_dir_page{page_num}_skipped",
+                        endpoint="",
+                        ok=False,
+                        message=f"翻页失败，已保留前 {len(files)} 个文件: {exc}",
+                        share_id=share_id,
+                    )
+                    break
+                next_files, _ = _extract_share_files(next_payload)
+                if not next_files:
+                    break
+                seen_ids = {item.file_id for item in files}
+                files.extend(item for item in next_files if item.file_id not in seen_ids)
 
         if not files and root_file_id:
             files.append(

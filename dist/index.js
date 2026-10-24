@@ -35,12 +35,12 @@ var DefaultContext = {
 var IconContext = SP_REACT.createContext && /*#__PURE__*/SP_REACT.createContext(DefaultContext);
 
 var _excluded = ["attr", "size", "title"];
-function _objectWithoutProperties(source, excluded) { if (source == null) return {}; var target = _objectWithoutPropertiesLoose(source, excluded); var key, i; if (Object.getOwnPropertySymbols) { var sourceSymbolKeys = Object.getOwnPropertySymbols(source); for (i = 0; i < sourceSymbolKeys.length; i++) { key = sourceSymbolKeys[i]; if (excluded.indexOf(key) >= 0) continue; if (!Object.prototype.propertyIsEnumerable.call(source, key)) continue; target[key] = source[key]; } } return target; }
-function _objectWithoutPropertiesLoose(source, excluded) { if (source == null) return {}; var target = {}; for (var key in source) { if (Object.prototype.hasOwnProperty.call(source, key)) { if (excluded.indexOf(key) >= 0) continue; target[key] = source[key]; } } return target; }
-function _extends() { _extends = Object.assign ? Object.assign.bind() : function (target) { for (var i = 1; i < arguments.length; i++) { var source = arguments[i]; for (var key in source) { if (Object.prototype.hasOwnProperty.call(source, key)) { target[key] = source[key]; } } } return target; }; return _extends.apply(this, arguments); }
+function _objectWithoutProperties(e, t) { if (null == e) return {}; var o, r, i = _objectWithoutPropertiesLoose(e, t); if (Object.getOwnPropertySymbols) { var n = Object.getOwnPropertySymbols(e); for (r = 0; r < n.length; r++) o = n[r], -1 === t.indexOf(o) && {}.propertyIsEnumerable.call(e, o) && (i[o] = e[o]); } return i; }
+function _objectWithoutPropertiesLoose(r, e) { if (null == r) return {}; var t = {}; for (var n in r) if ({}.hasOwnProperty.call(r, n)) { if (-1 !== e.indexOf(n)) continue; t[n] = r[n]; } return t; }
+function _extends() { return _extends = Object.assign ? Object.assign.bind() : function (n) { for (var e = 1; e < arguments.length; e++) { var t = arguments[e]; for (var r in t) ({}).hasOwnProperty.call(t, r) && (n[r] = t[r]); } return n; }, _extends.apply(null, arguments); }
 function ownKeys(e, r) { var t = Object.keys(e); if (Object.getOwnPropertySymbols) { var o = Object.getOwnPropertySymbols(e); r && (o = o.filter(function (r) { return Object.getOwnPropertyDescriptor(e, r).enumerable; })), t.push.apply(t, o); } return t; }
 function _objectSpread(e) { for (var r = 1; r < arguments.length; r++) { var t = null != arguments[r] ? arguments[r] : {}; r % 2 ? ownKeys(Object(t), true).forEach(function (r) { _defineProperty(e, r, t[r]); }) : Object.getOwnPropertyDescriptors ? Object.defineProperties(e, Object.getOwnPropertyDescriptors(t)) : ownKeys(Object(t)).forEach(function (r) { Object.defineProperty(e, r, Object.getOwnPropertyDescriptor(t, r)); }); } return e; }
-function _defineProperty(obj, key, value) { key = _toPropertyKey(key); if (key in obj) { Object.defineProperty(obj, key, { value: value, enumerable: true, configurable: true, writable: true }); } else { obj[key] = value; } return obj; }
+function _defineProperty(e, r, t) { return (r = _toPropertyKey(r)) in e ? Object.defineProperty(e, r, { value: t, enumerable: true, configurable: true, writable: true }) : e[r] = t, e; }
 function _toPropertyKey(t) { var i = _toPrimitive(t, "string"); return "symbol" == typeof i ? i : i + ""; }
 function _toPrimitive(t, r) { if ("object" != typeof t || !t) return t; var e = t[Symbol.toPrimitive]; if (void 0 !== e) { var i = e.call(t, r); if ("object" != typeof i) return i; throw new TypeError("@@toPrimitive must return a primitive value."); } return ("string" === r ? String : Number)(t); }
 function Tree2Element(tree) {
@@ -55,11 +55,9 @@ function GenIcon(data) {
 }
 function IconBase(props) {
   var elem = conf => {
-    var {
-        attr,
-        size,
-        title
-      } = props,
+    var attr = props.attr,
+      size = props.size,
+      title = props.title,
       svgProps = _objectWithoutProperties(props, _excluded);
     var computedSize = size || conf.size || "1em";
     var className;
@@ -103,6 +101,9 @@ const getTianyiCloudSaveRestoreStatus = callable("get_tianyi_cloud_save_restore_
 const recordTianyiGameAction = callable("record_tianyi_game_action");
 const getTianyiLibraryGameTimeStats = callable("get_tianyi_library_game_time_stats");
 const uninstallTianyiInstalledGame = callable("uninstall_tianyi_installed_game");
+const pauseTianyiTask = callable("pause_tianyi_task");
+const resumeTianyiTask = callable("resume_tianyi_task");
+const removeTianyiTask = callable("remove_tianyi_task");
 const PANEL_REQUEST_TIMEOUT_MS = 6000;
 const PANEL_POLL_MODE_ACTIVE = "active";
 const PANEL_POLL_MODE_IDLE = "idle";
@@ -271,13 +272,19 @@ function progressColors(task) {
     }
     return { track: "rgba(208, 188, 255, 0.24)", fill: "#d0bcff", label: "#ece2ff" };
 }
-function TaskProgressRow(task) {
+function TaskProgressRow(task, actions) {
     const progress = clampProgress(task.progress);
     const colors = progressColors(task);
     const title = task.game_title || task.game_name || task.file_name || "未命名任务";
     const installStatus = String(task.install_status || "").trim();
     const installMessage = String(task.install_message || "").trim();
     const errorReason = String(task.error_reason || "").trim();
+    const status = String(task.status || "").toLowerCase();
+    const canPause = (status === "active" || status === "waiting") && Boolean(actions?.onPause);
+    const canResume = (status === "paused" || status === "error") && Boolean(actions?.onResume);
+    const canRemove = status !== "removed" && Boolean(actions?.onRemove);
+    const busy = Boolean(actions?.pendingTaskId) && actions?.pendingTaskId === task.task_id;
+    const hasActions = canPause || canResume || canRemove;
     return (SP_JSX.jsxs("div", { style: {
             width: "100%",
             padding: "8px 0",
@@ -304,7 +311,18 @@ function TaskProgressRow(task) {
                         borderRadius: "999px",
                         background: colors.fill,
                         transition: "width 860ms linear",
-                    } }) }), SP_JSX.jsxs("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", fontSize: "11px", color: "#c9c9c9" }, children: [SP_JSX.jsx("span", { children: `进度 ${progress.toFixed(1)}%` }), SP_JSX.jsx("span", { children: `速度 ${formatSpeed(task.speed)}` })] }), installStatus ? (SP_JSX.jsx("div", { style: { fontSize: "11px", color: "#bcbcbc", lineHeight: 1.4 }, children: `安装：${installStatusText(installStatus)}${installMessage ? ` | ${installMessage}` : ""}` })) : null, errorReason ? (SP_JSX.jsx("div", { style: { fontSize: "11px", color: "#ff8e8e", lineHeight: 1.4 }, children: `错误：${errorReason}` })) : null] }));
+                    } }) }), SP_JSX.jsxs("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", fontSize: "11px", color: "#c9c9c9" }, children: [SP_JSX.jsx("span", { children: `进度 ${progress.toFixed(1)}%` }), SP_JSX.jsx("span", { children: `速度 ${formatSpeed(task.speed)}` })] }), installStatus ? (SP_JSX.jsx("div", { style: { fontSize: "11px", color: "#bcbcbc", lineHeight: 1.4 }, children: `安装：${installStatusText(installStatus)}${installMessage ? ` | ${installMessage}` : ""}` })) : null, errorReason ? (SP_JSX.jsx("div", { style: { fontSize: "11px", color: "#ff8e8e", lineHeight: 1.4 }, children: `错误：${errorReason}` })) : null, hasActions ? (SP_JSX.jsxs("div", { style: { display: "flex", gap: "8px", justifyContent: "flex-end" }, children: [canPause ? (SP_JSX.jsx(DFL.DialogButton, { onClick: () => actions?.onPause?.(task), disabled: busy, style: { minWidth: "64px", borderRadius: "10px", fontSize: "12px" }, children: busy ? "..." : "暂停" })) : null, canResume ? (SP_JSX.jsx(DFL.DialogButton, { onClick: () => actions?.onResume?.(task), disabled: busy, style: {
+                            minWidth: "64px",
+                            borderRadius: "10px",
+                            fontSize: "12px",
+                            borderColor: "rgba(208, 188, 255, 0.4)",
+                        }, children: busy ? "..." : status === "error" ? "重试" : "恢复" })) : null, canRemove ? (SP_JSX.jsx(DFL.DialogButton, { onClick: () => actions?.onRemove?.(task), disabled: busy, style: {
+                            minWidth: "64px",
+                            borderRadius: "10px",
+                            fontSize: "12px",
+                            background: "rgba(255, 106, 106, 0.2)",
+                            color: "#ffe8e8",
+                        }, children: busy ? "..." : "删除" })) : null] })) : null] }));
 }
 function openExternalUrl(rawUrl) {
     const url = String(rawUrl || "").trim();
@@ -509,6 +527,19 @@ function invalidateLibraryTimeCacheByAppId(appId) {
         }
     }
 }
+function sweepLibraryTimeCache() {
+    // 过期条目只有在用户重新访问同一游戏页时才会被删除，
+    // 长期浏览大量游戏会让模块级 Map 单调增长，写入时顺带清扫。
+    const now = Date.now();
+    for (const [key, cached] of Array.from(libraryTimeCache.entries())) {
+        const ttl = hasPositiveLibraryHltb(cached.payload)
+            ? LIBRARY_TIME_CACHE_TTL_MS
+            : LIBRARY_TIME_NEGATIVE_CACHE_TTL_MS;
+        if (now - cached.updatedAt > ttl) {
+            libraryTimeCache.delete(key);
+        }
+    }
+}
 function resolveSteamAppsGameActionApi() {
     if (typeof window === "undefined")
         return null;
@@ -587,6 +618,20 @@ function installGlobalGameActionReporter() {
             });
         }
         catch {
+            // 半注册失败时先反注册已成功的那个，否则泄漏的 listener
+            // 会在重试后与新 listener 叠加收到双份事件。
+            try {
+                startListener?.unregister?.();
+            }
+            catch {
+                // 忽略反注册异常。
+            }
+            try {
+                endListener?.unregister?.();
+            }
+            catch {
+                // 忽略反注册异常。
+            }
             scheduleRetry();
             return;
         }
@@ -909,28 +954,31 @@ function resolveLibraryOverviewNode(tree) {
         return Boolean(title);
     });
 }
-function resolvePatchHandleUnpatch(handle) {
-    if (handle && typeof handle === "object" && typeof handle.unpatch === "function") {
-        return () => {
-            try {
-                handle.unpatch();
-            }
-            catch {
-                // 忽略移除 patch 异常。
-            }
-        };
+const LIBRARY_PLAYTIME_ROUTE = "/library/app/:appid";
+let libraryRoutePatcher = null;
+const libraryInnerUnpatches = [];
+function uninstallLibraryPlaytimePatch() {
+    const hookApi = routerHook;
+    // @decky/api 的 addPatch 返回传入的 patcher 本身，
+    // 移除必须调用 removePatch(route, patcher)。
+    if (libraryRoutePatcher && typeof hookApi.removePatch === "function") {
+        try {
+            hookApi.removePatch(LIBRARY_PLAYTIME_ROUTE, libraryRoutePatcher);
+        }
+        catch {
+            // 忽略移除 patch 异常。
+        }
     }
-    if (typeof handle === "function") {
-        return () => {
-            try {
-                handle();
-            }
-            catch {
-                // 忽略移除 patch 异常。
-            }
-        };
+    libraryRoutePatcher = null;
+    const pending = libraryInnerUnpatches.splice(0);
+    for (const unpatch of pending) {
+        try {
+            unpatch();
+        }
+        catch {
+            // 忽略移除 patch 异常。
+        }
     }
-    return () => { };
 }
 function LibraryTimeBlock({ appId, title }) {
     const appIdText = String(Math.max(0, Number(appId || 0)));
@@ -986,6 +1034,7 @@ function LibraryTimeBlock({ appId, title }) {
                 }
                 const payload = (result.data || {});
                 libraryTimeCache.set(cacheKey, { updatedAt: Date.now(), payload });
+                sweepLibraryTimeCache();
                 setData(payload);
                 scheduleNext(payload);
             }
@@ -1052,7 +1101,11 @@ function installLibraryPlaytimePatch() {
     if (typeof hookApi.addPatch !== "function") {
         return () => { };
     }
-    const patchHandle = hookApi.addPatch("/library/app/:appid", (props) => {
+    // 已安装时返回现有卸载函数，避免反复装卸叠加多份 patch。
+    if (libraryRoutePatcher) {
+        return uninstallLibraryPlaytimePatch;
+    }
+    const routePatcher = (props) => {
         if (!props || typeof props !== "object")
             return props;
         const propsMap = props;
@@ -1141,6 +1194,15 @@ function installLibraryPlaytimePatch() {
                 spliceTarget.splice(insertIndex, 0, nextComponent);
                 return ret2;
             });
+            const typeUnpatch = typePatch.unpatch;
+            libraryInnerUnpatches.push(() => {
+                try {
+                    typeUnpatch();
+                }
+                catch {
+                    // 忽略移除 patch 异常。
+                }
+            });
             const patchedType = wrappedType.type;
             patchedType.__FREDECK_LIBRARY_TYPE_PATCHED = true;
             patchedType.__FREDECK_LIBRARY_APP_ID = appId;
@@ -1148,12 +1210,23 @@ function installLibraryPlaytimePatch() {
             patchedType.__FREDECK_LIBRARY_TYPE_UNPATCH = typePatch.unpatch;
             return ret1;
         });
+        const renderUnpatch = renderPatch.unpatch;
+        libraryInnerUnpatches.push(() => {
+            try {
+                renderUnpatch();
+            }
+            catch {
+                // 忽略移除 patch 异常。
+            }
+        });
         const patchedRender = childProps.renderFunc;
         patchedRender.__FREDECK_LIBRARY_RENDER_PATCHED = true;
         patchedRender.__FREDECK_LIBRARY_RENDER_UNPATCH = renderPatch.unpatch;
         return props;
-    });
-    return resolvePatchHandleUnpatch(patchHandle);
+    };
+    hookApi.addPatch(LIBRARY_PLAYTIME_ROUTE, routePatcher);
+    libraryRoutePatcher = routePatcher;
+    return uninstallLibraryPlaytimePatch;
 }
 async function withTimeout(promise, timeoutMs, timeoutMessage) {
     return new Promise((resolve, reject) => {
@@ -1261,27 +1334,51 @@ function SettingsPage() {
         label: `${item.display_time || item.version_name} | ${formatBytes(item.size_bytes)}`,
     })), [selectedRestoreGame]);
     SP_REACT.useEffect(() => {
-        const classMap = getGamepadTabClassMap();
-        if (!classMap)
-            return;
         const styleId = "freedeck-settings-tabs-no-jitter";
-        if (document.getElementById(styleId))
-            return;
-        const style = document.createElement("style");
-        style.id = styleId;
-        const rules = [];
-        if (classMap.TabsRowScroll) {
-            rules.push(`.${classMap.TabsRowScroll}{scroll-behavior:auto !important;}`);
-        }
-        if (classMap.TabRowTabs) {
-            rules.push(`.${classMap.TabRowTabs}{transition:none !important;}`);
-            rules.push(`.${classMap.TabRowTabs}{scroll-snap-type:none !important;}`);
-        }
-        if (classMap.Tab) {
-            rules.push(`.${classMap.Tab}{transition:none !important;}`);
-        }
-        style.textContent = rules.join("\n");
-        document.head.appendChild(style);
+        let disposed = false;
+        let retryTimer = 0;
+        let retryCount = 0;
+        let injectedStyle = null;
+        const inject = () => {
+            if (disposed)
+                return;
+            if (document.getElementById(styleId))
+                return;
+            const classMap = getGamepadTabClassMap();
+            if (!classMap) {
+                // gamepad 类名可能注入较晚，短暂重试而不是永久放弃。
+                if (retryCount < 20) {
+                    retryCount += 1;
+                    retryTimer = window.setTimeout(inject, 500);
+                }
+                return;
+            }
+            const style = document.createElement("style");
+            style.id = styleId;
+            const rules = [];
+            if (classMap.TabsRowScroll) {
+                rules.push(`.${classMap.TabsRowScroll}{scroll-behavior:auto !important;}`);
+            }
+            if (classMap.TabRowTabs) {
+                rules.push(`.${classMap.TabRowTabs}{transition:none !important;}`);
+                rules.push(`.${classMap.TabRowTabs}{scroll-snap-type:none !important;}`);
+            }
+            if (classMap.Tab) {
+                rules.push(`.${classMap.Tab}{transition:none !important;}`);
+            }
+            style.textContent = rules.join("\n");
+            document.head.appendChild(style);
+            injectedStyle = style;
+        };
+        inject();
+        return () => {
+            disposed = true;
+            if (retryTimer)
+                window.clearTimeout(retryTimer);
+            // 只移除自己插入的节点，页面卸载后不残留。
+            injectedStyle?.remove();
+            injectedStyle = null;
+        };
     }, []);
     SP_REACT.useEffect(() => {
         if (!restoreOptions.length) {
@@ -1336,10 +1433,13 @@ function SettingsPage() {
         }
         const nextState = normalizeCloudSaveRestoreState(result.data?.state);
         setCloudSaveRestoreState(nextState);
-        if (Array.isArray(nextState.selected_entry_ids) && nextState.selected_entry_ids.length > 0 && selectedRestoreEntryIds.length === 0) {
-            setSelectedRestoreEntryIds(nextState.selected_entry_ids);
+        // 用函数式 setState 读取当前值，避免把 selectedRestoreEntryIds
+        // 写进依赖导致勾选存档项时整个初始化 effect 重跑、覆盖未保存的草稿。
+        if (Array.isArray(nextState.selected_entry_ids) && nextState.selected_entry_ids.length > 0) {
+            const incoming = nextState.selected_entry_ids;
+            setSelectedRestoreEntryIds((current) => (current.length === 0 ? incoming : current));
         }
-    }, [selectedRestoreEntryIds.length]);
+    }, []);
     const refreshRestoreOptions = SP_REACT.useCallback(async () => {
         if (loadingRestoreOptions)
             return;
@@ -1876,6 +1976,7 @@ function Content() {
     const [openingLogin, setOpeningLogin] = SP_REACT.useState(false);
     const [openingLibrary, setOpeningLibrary] = SP_REACT.useState(false);
     const [uninstallingKey, setUninstallingKey] = SP_REACT.useState("");
+    const [pendingTaskId, setPendingTaskId] = SP_REACT.useState("");
     const syncingRef = SP_REACT.useRef(false);
     const latestStateRef = SP_REACT.useRef(EMPTY_STATE);
     const syncState = SP_REACT.useCallback(async (pollMode = PANEL_POLL_MODE_IDLE) => {
@@ -2032,6 +2133,58 @@ function Content() {
             toaster.toast({ title: "Freedeck", body: `打开设置失败：${error}` });
         }
     }, []);
+    const runTaskAction = SP_REACT.useCallback(async (task, action) => {
+        if (pendingTaskId)
+            return;
+        setPendingTaskId(task.task_id);
+        try {
+            let result;
+            if (action === "pause") {
+                result = await pauseTianyiTask({ task_id: task.task_id });
+            }
+            else if (action === "resume") {
+                result = await resumeTianyiTask({ task_id: task.task_id });
+            }
+            else {
+                result = await removeTianyiTask({ task_id: task.task_id, delete_files: true });
+            }
+            if (result.status !== "success") {
+                throw new Error(result.message || "任务操作失败");
+            }
+            if (action === "remove") {
+                const removeData = result.data;
+                const deleted = Array.isArray(removeData?.deleted_files);
+                toaster.toast({
+                    title: "Freedeck",
+                    body: deleted
+                        ? `已删除任务及下载文件：${task.game_title || task.file_name}`
+                        : `已删除任务：${task.game_title || task.file_name}`,
+                });
+            }
+            else if (action === "resume" && String(task.status || "").toLowerCase() === "error") {
+                toaster.toast({ title: "Freedeck", body: "已重新获取下载链接并开始重试" });
+            }
+            await syncState("active");
+        }
+        catch (error) {
+            toaster.toast({ title: "Freedeck", body: String(error) });
+        }
+        finally {
+            setPendingTaskId("");
+        }
+    }, [pendingTaskId, syncState]);
+    const onTaskPause = SP_REACT.useCallback((task) => {
+        void runTaskAction(task, "pause");
+    }, [runTaskAction]);
+    const onTaskResume = SP_REACT.useCallback((task) => {
+        void runTaskAction(task, "resume");
+    }, [runTaskAction]);
+    const onTaskRemove = SP_REACT.useCallback((task) => {
+        const title = task.game_title || task.game_name || task.file_name || "该任务";
+        DFL.showModal(SP_JSX.jsx(DFL.ConfirmModal, { strTitle: "\u786E\u8BA4\u5220\u9664", strDescription: `确定删除「${title}」的下载任务吗？\n\n将同时删除已下载的部分文件。`, strOKButtonText: "\u786E\u8BA4\u5220\u9664", strCancelButtonText: "\u53D6\u6D88", onOK: () => {
+                void runTaskAction(task, "remove");
+            }, onCancel: () => { } }));
+    }, [runTaskAction]);
     const installedGames = SP_REACT.useMemo(() => state.installed?.preview || [], [state.installed]);
     const installedGameIds = SP_REACT.useMemo(() => {
         const set = new Set();
@@ -2117,7 +2270,12 @@ function Content() {
                                 overflow: "hidden",
                                 textOverflow: "ellipsis",
                                 whiteSpace: "nowrap",
-                            }, title: loginStatusText, children: loginStatusText }) }), SP_JSX.jsxs(DFL.PanelSectionRow, { children: [!state.login.logged_in && (SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: onLogin, disabled: openingLogin || openingLibrary, children: openingLogin ? "登录入口准备中..." : "登录" })), SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: onOpenLibrary, disabled: openingLibrary || openingLogin, children: openingLibrary ? "游戏列表准备中..." : "游戏列表" }), SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: onOpenSettings, children: "\u8BBE\u7F6E" })] })] }), visibleTasks.length > 0 && (SP_JSX.jsx(DFL.PanelSection, { title: `下载列表（${visibleTasks.length}）`, children: visibleTasks.slice(0, 20).map((task) => (SP_JSX.jsx(DFL.PanelSectionRow, { children: TaskProgressRow(task) }, task.task_id))) })), sortedInstalledGames.length > 0 && (SP_JSX.jsx(DFL.PanelSection, { title: `游戏预览（已安装 ${state.installed.total || sortedInstalledGames.length}）`, children: sortedInstalledGames.map((item, index) => {
+                            }, title: loginStatusText, children: loginStatusText }) }), SP_JSX.jsxs(DFL.PanelSectionRow, { children: [!state.login.logged_in && (SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: onLogin, disabled: openingLogin || openingLibrary, children: openingLogin ? "登录入口准备中..." : "登录" })), SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: onOpenLibrary, disabled: openingLibrary || openingLogin, children: openingLibrary ? "游戏列表准备中..." : "游戏列表" }), SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: onOpenSettings, children: "\u8BBE\u7F6E" })] })] }), visibleTasks.length > 0 && (SP_JSX.jsx(DFL.PanelSection, { title: `下载列表（${visibleTasks.length}）`, children: visibleTasks.slice(0, 20).map((task) => (SP_JSX.jsx(DFL.PanelSectionRow, { children: TaskProgressRow(task, {
+                        onPause: onTaskPause,
+                        onResume: onTaskResume,
+                        onRemove: onTaskRemove,
+                        pendingTaskId,
+                    }) }, task.task_id))) })), sortedInstalledGames.length > 0 && (SP_JSX.jsx(DFL.PanelSection, { title: `游戏预览（已安装 ${state.installed.total || sortedInstalledGames.length}）`, children: sortedInstalledGames.map((item, index) => {
                     const uninstallKey = `${item.game_id || ""}::${item.install_path || ""}`;
                     const uninstalling = uninstallingKey === uninstallKey;
                     return (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px", width: "100%" }, children: [SP_JSX.jsxs("div", { style: { minWidth: 0, flex: 1 }, children: [SP_JSX.jsx("div", { style: {

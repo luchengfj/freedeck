@@ -53,25 +53,40 @@ def _is_valid_tianyi_url(url: str) -> bool:
     return value.startswith("https://cloud.189.cn/t/") or value.startswith("http://cloud.189.cn/t/")
 
 
-def resolve_default_catalog_path() -> str:
-    """解析默认目录文件路径。"""
+def _catalog_csv_candidates(plugin_dir: str) -> List[Path]:
+    """构造默认目录 CSV 的候选列表（按优先级排序）。"""
     candidates: List[Path] = []
 
-    env_path = (os.getenv("FRIENDECK_GAME_CATALOG_CSV") or "").strip()
+    # 兼容新旧两种环境变量拼写（FREEDECK 为准，FRIENDECK 为历史遗留）。
+    env_path = (os.getenv("FREEDECK_GAME_CATALOG_CSV") or os.getenv("FRIENDECK_GAME_CATALOG_CSV") or "").strip()
     if env_path:
         candidates.append(Path(env_path))
 
-    plugin_dir = getattr(decky, "DECKY_PLUGIN_DIR", None)
     if plugin_dir:
         root = Path(plugin_dir)
-        candidates.append(root / "defaults" / "tianyi_catalog" / "gamebox_all_links_20260221_234730.csv")
+        catalog_dir = root / "defaults" / "tianyi_catalog"
+        # 目录里的 CSV 以日期命名、随版本更新，不能写死文件名：
+        # 优先取文件名（日期）最新的一个，避免更新列表后仍读旧文件。
+        if catalog_dir.is_dir():
+            dated = sorted(
+                catalog_dir.glob("gamebox_all_links_*.csv"),
+                key=lambda p: p.name,
+                reverse=True,
+            )
+            candidates.extend(dated)
         candidates.append(root / "defaults" / "tianyi_catalog.csv")
 
     cwd = Path.cwd()
     candidates.append(cwd / "exports" / "gamebox_all_links_20260221_234730.csv")
     candidates.append(cwd / "gamebox_all_links_20260221_234730.csv")
 
-    for path in candidates:
+    return candidates
+
+
+def resolve_default_catalog_path() -> str:
+    """解析默认目录文件路径。"""
+    plugin_dir = getattr(decky, "DECKY_PLUGIN_DIR", None)
+    for path in _catalog_csv_candidates(plugin_dir or ""):
         try:
             resolved = path.expanduser().resolve()
         except Exception:

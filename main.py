@@ -245,6 +245,38 @@ class Plugin:
         except Exception as exc:
             return {"status": "error", "message": str(exc), "data": {}}
 
+    async def pause_tianyi_task(self, payload=None, task_id: str = "") -> dict:
+        """暂停下载任务。"""
+        try:
+            if isinstance(payload, dict):
+                task_id = str(payload.get("task_id", task_id))
+            data = await self._get_tianyi_service().pause_task(task_id)
+            return {"status": "success", "data": data}
+        except Exception as exc:
+            return {"status": "error", "message": str(exc), "data": {}}
+
+    async def resume_tianyi_task(self, payload=None, task_id: str = "") -> dict:
+        """恢复下载任务（断线/直链过期的失败任务会自动重新取链重试）。"""
+        try:
+            if isinstance(payload, dict):
+                task_id = str(payload.get("task_id", task_id))
+            data = await self._get_tianyi_service().resume_task(task_id)
+            return {"status": "success", "data": data}
+        except Exception as exc:
+            return {"status": "error", "message": str(exc), "data": {}}
+
+    async def remove_tianyi_task(self, payload=None, task_id: str = "", delete_files: bool = True) -> dict:
+        """移除下载任务，并清理半成品文件与 aria2 控制文件。"""
+        try:
+            if isinstance(payload, dict):
+                task_id = str(payload.get("task_id", task_id))
+                if "delete_files" in payload:
+                    delete_files = bool(payload.get("delete_files"))
+            data = await self._get_tianyi_service().remove_task(task_id, delete_files=delete_files)
+            return {"status": "success", "data": data}
+        except Exception as exc:
+            return {"status": "error", "message": str(exc), "data": {}}
+
     async def start_tianyi_cloud_save_upload(self) -> dict:
         """启动云存档上传任务。"""
         try:

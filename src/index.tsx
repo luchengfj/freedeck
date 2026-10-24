@@ -332,6 +332,12 @@ const getTianyiLibraryGameTimeStats = callable<
 const uninstallTianyiInstalledGame = callable<[UninstallInstalledPayload], ApiResponse<Record<string, unknown>>>(
   "uninstall_tianyi_installed_game",
 );
+const pauseTianyiTask = callable<[{ task_id: string }], ApiResponse<TaskItem>>("pause_tianyi_task");
+const resumeTianyiTask = callable<[{ task_id: string }], ApiResponse<TaskItem>>("resume_tianyi_task");
+const removeTianyiTask = callable<
+  [{ task_id: string; delete_files?: boolean }],
+  ApiResponse<Record<string, unknown>>
+>("remove_tianyi_task");
 const PANEL_REQUEST_TIMEOUT_MS = 6000;
 const PANEL_POLL_MODE_ACTIVE = "active";
 const PANEL_POLL_MODE_IDLE = "idle";
@@ -503,13 +509,27 @@ function progressColors(task: TaskItem): { track: string; fill: string; label: s
   return { track: "rgba(208, 188, 255, 0.24)", fill: "#d0bcff", label: "#ece2ff" };
 }
 
-function TaskProgressRow(task: TaskItem) {
+interface TaskActionCallbacks {
+  onPause?: (task: TaskItem) => void;
+  onResume?: (task: TaskItem) => void;
+  onRemove?: (task: TaskItem) => void;
+  pendingTaskId?: string;
+}
+
+function TaskProgressRow(task: TaskItem, actions?: TaskActionCallbacks) {
   const progress = clampProgress(task.progress);
   const colors = progressColors(task);
   const title = task.game_title || task.game_name || task.file_name || "未命名任务";
   const installStatus = String(task.install_status || "").trim();
   const installMessage = String(task.install_message || "").trim();
   const errorReason = String(task.error_reason || "").trim();
+
+  const status = String(task.status || "").toLowerCase();
+  const canPause = (status === "active" || status === "waiting") && Boolean(actions?.onPause);
+  const canResume = (status === "paused" || status === "error") && Boolean(actions?.onResume);
+  const canRemove = status !== "removed" && Boolean(actions?.onRemove);
+  const busy = Boolean(actions?.pendingTaskId) && actions?.pendingTaskId === task.task_id;
+  const hasActions = canPause || canResume || canRemove;
 
   return (
     <div
@@ -571,6 +591,49 @@ function TaskProgressRow(task: TaskItem) {
       ) : null}
       {errorReason ? (
         <div style={{ fontSize: "11px", color: "#ff8e8e", lineHeight: 1.4 }}>{`错误：${errorReason}`}</div>
+      ) : null}
+
+      {hasActions ? (
+        <div style={{ display: "flex", gap: "8px", justifyContent: "flex-end" }}>
+          {canPause ? (
+            <DialogButton
+              onClick={() => actions?.onPause?.(task)}
+              disabled={busy}
+              style={{ minWidth: "64px", borderRadius: "10px", fontSize: "12px" }}
+            >
+              {busy ? "..." : "暂停"}
+            </DialogButton>
+          ) : null}
+          {canResume ? (
+            <DialogButton
+              onClick={() => actions?.onResume?.(task)}
+              disabled={busy}
+              style={{
+                minWidth: "64px",
+                borderRadius: "10px",
+                fontSize: "12px",
+                borderColor: "rgba(208, 188, 255, 0.4)",
+              }}
+            >
+              {busy ? "..." : status === "error" ? "重试" : "恢复"}
+            </DialogButton>
+          ) : null}
+          {canRemove ? (
+            <DialogButton
+              onClick={() => actions?.onRemove?.(task)}
+              disabled={busy}
+              style={{
+                minWidth: "64px",
+                borderRadius: "10px",
+                fontSize: "12px",
+                background: "rgba(255, 106, 106, 0.2)",
+                color: "#ffe8e8",
+              }}
+            >
+              {busy ? "..." : "删除"}
+            </DialogButton>
+          ) : null}
+        </div>
       ) : null}
     </div>
   );
@@ -787,6 +850,20 @@ function invalidateLibraryTimeCacheByAppId(appId: string): void {
   }
 }
 
+function sweepLibraryTimeCache(): void {
+  // 过期条目只有在用户重新访问同一游戏页时才会被删除，
+  // 长期浏览大量游戏会让模块级 Map 单调增长，写入时顺带清扫。
+  const now = Date.now();
+  for (const [key, cached] of Array.from(libraryTimeCache.entries())) {
+    const ttl = hasPositiveLibraryHltb(cached.payload)
+      ? LIBRARY_TIME_CACHE_TTL_MS
+      : LIBRARY_TIME_NEGATIVE_CACHE_TTL_MS;
+    if (now - cached.updatedAt > ttl) {
+      libraryTimeCache.delete(key);
+    }
+  }
+}
+
 function resolveSteamAppsGameActionApi(): SteamAppsGameActionApi | null {
   if (typeof window === "undefined") return null;
   const apps = (
@@ -869,6 +946,18 @@ function installGlobalGameActionReporter(): () => void {
         reportAction("end", args);
       });
     } catch {
+      // 半注册失败时先反注册已成功的那个，否则泄漏的 listener
+      // 会在重试后与新 listener 叠加收到双份事件。
+      try {
+        startListener?.unregister?.();
+      } catch {
+        // 忽略反注册异常。
+      }
+      try {
+        endListener?.unregister?.();
+      } catch {
+        // 忽略反注册异常。
+      }
       scheduleRetry();
       return;
     }
@@ -1182,26 +1271,32 @@ function resolveLibraryOverviewNode(tree: unknown): Record<string, unknown> | nu
   });
 }
 
-function resolvePatchHandleUnpatch(handle: unknown): () => void {
-  if (handle && typeof handle === "object" && typeof (handle as { unpatch?: unknown }).unpatch === "function") {
-    return () => {
-      try {
-        (handle as { unpatch: () => void }).unpatch();
-      } catch {
-        // 忽略移除 patch 异常。
-      }
-    };
+const LIBRARY_PLAYTIME_ROUTE = "/library/app/:appid";
+let libraryRoutePatcher: ((props: unknown) => unknown) | null = null;
+const libraryInnerUnpatches: Array<() => void> = [];
+
+function uninstallLibraryPlaytimePatch(): void {
+  const hookApi = routerHook as unknown as {
+    removePatch?: (route: string, patcher: (props: unknown) => unknown) => void;
+  };
+  // @decky/api 的 addPatch 返回传入的 patcher 本身，
+  // 移除必须调用 removePatch(route, patcher)。
+  if (libraryRoutePatcher && typeof hookApi.removePatch === "function") {
+    try {
+      hookApi.removePatch(LIBRARY_PLAYTIME_ROUTE, libraryRoutePatcher);
+    } catch {
+      // 忽略移除 patch 异常。
+    }
   }
-  if (typeof handle === "function") {
-    return () => {
-      try {
-        (handle as () => void)();
-      } catch {
-        // 忽略移除 patch 异常。
-      }
-    };
+  libraryRoutePatcher = null;
+  const pending = libraryInnerUnpatches.splice(0);
+  for (const unpatch of pending) {
+    try {
+      unpatch();
+    } catch {
+      // 忽略移除 patch 异常。
+    }
   }
-  return () => {};
 }
 
 function LibraryTimeBlock({ appId, title }: { appId: number; title: string }) {
@@ -1261,6 +1356,7 @@ function LibraryTimeBlock({ appId, title }: { appId: number; title: string }) {
         }
         const payload = (result.data || {}) as LibraryGameTimeStatsData;
         libraryTimeCache.set(cacheKey, { updatedAt: Date.now(), payload });
+        sweepLibraryTimeCache();
         setData(payload);
         scheduleNext(payload);
       } catch {
@@ -1355,12 +1451,17 @@ function LibraryTimeBlock({ appId, title }: { appId: number; title: string }) {
 function installLibraryPlaytimePatch(): () => void {
   const hookApi = routerHook as unknown as {
     addPatch?: (route: string, patcher: (props: unknown) => unknown) => unknown;
+    removePatch?: (route: string, patcher: (props: unknown) => unknown) => void;
   };
   if (typeof hookApi.addPatch !== "function") {
     return () => {};
   }
+  // 已安装时返回现有卸载函数，避免反复装卸叠加多份 patch。
+  if (libraryRoutePatcher) {
+    return uninstallLibraryPlaytimePatch;
+  }
 
-  const patchHandle = hookApi.addPatch("/library/app/:appid", (props: unknown) => {
+  const routePatcher = (props: unknown) => {
     if (!props || typeof props !== "object") return props;
     const propsMap = props as Record<string, unknown>;
     const childNode = propsMap.children as Record<string, unknown> | undefined;
@@ -1453,6 +1554,14 @@ function installLibraryPlaytimePatch(): () => void {
         return ret2;
       });
 
+      const typeUnpatch = typePatch.unpatch;
+      libraryInnerUnpatches.push(() => {
+        try {
+          typeUnpatch();
+        } catch {
+          // 忽略移除 patch 异常。
+        }
+      });
       const patchedType = wrappedType.type as Record<string, unknown>;
       patchedType.__FREDECK_LIBRARY_TYPE_PATCHED = true;
       patchedType.__FREDECK_LIBRARY_APP_ID = appId;
@@ -1461,13 +1570,23 @@ function installLibraryPlaytimePatch(): () => void {
       return ret1;
     });
 
+    const renderUnpatch = renderPatch.unpatch;
+    libraryInnerUnpatches.push(() => {
+      try {
+        renderUnpatch();
+      } catch {
+        // 忽略移除 patch 异常。
+      }
+    });
     const patchedRender = childProps.renderFunc as Record<string, unknown>;
     patchedRender.__FREDECK_LIBRARY_RENDER_PATCHED = true;
     patchedRender.__FREDECK_LIBRARY_RENDER_UNPATCH = renderPatch.unpatch;
     return props;
-  });
+  };
 
-  return resolvePatchHandleUnpatch(patchHandle);
+  hookApi.addPatch(LIBRARY_PLAYTIME_ROUTE, routePatcher);
+  libraryRoutePatcher = routePatcher;
+  return uninstallLibraryPlaytimePatch;
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
@@ -1586,25 +1705,50 @@ function SettingsPage() {
   );
 
   useEffect(() => {
-    const classMap = getGamepadTabClassMap();
-    if (!classMap) return;
     const styleId = "freedeck-settings-tabs-no-jitter";
-    if (document.getElementById(styleId)) return;
-    const style = document.createElement("style");
-    style.id = styleId;
-    const rules: string[] = [];
-    if (classMap.TabsRowScroll) {
-      rules.push(`.${classMap.TabsRowScroll}{scroll-behavior:auto !important;}`);
-    }
-    if (classMap.TabRowTabs) {
-      rules.push(`.${classMap.TabRowTabs}{transition:none !important;}`);
-      rules.push(`.${classMap.TabRowTabs}{scroll-snap-type:none !important;}`);
-    }
-    if (classMap.Tab) {
-      rules.push(`.${classMap.Tab}{transition:none !important;}`);
-    }
-    style.textContent = rules.join("\n");
-    document.head.appendChild(style);
+    let disposed = false;
+    let retryTimer = 0;
+    let retryCount = 0;
+    let injectedStyle: HTMLStyleElement | null = null;
+
+    const inject = () => {
+      if (disposed) return;
+      if (document.getElementById(styleId)) return;
+      const classMap = getGamepadTabClassMap();
+      if (!classMap) {
+        // gamepad 类名可能注入较晚，短暂重试而不是永久放弃。
+        if (retryCount < 20) {
+          retryCount += 1;
+          retryTimer = window.setTimeout(inject, 500);
+        }
+        return;
+      }
+      const style = document.createElement("style");
+      style.id = styleId;
+      const rules: string[] = [];
+      if (classMap.TabsRowScroll) {
+        rules.push(`.${classMap.TabsRowScroll}{scroll-behavior:auto !important;}`);
+      }
+      if (classMap.TabRowTabs) {
+        rules.push(`.${classMap.TabRowTabs}{transition:none !important;}`);
+        rules.push(`.${classMap.TabRowTabs}{scroll-snap-type:none !important;}`);
+      }
+      if (classMap.Tab) {
+        rules.push(`.${classMap.Tab}{transition:none !important;}`);
+      }
+      style.textContent = rules.join("\n");
+      document.head.appendChild(style);
+      injectedStyle = style;
+    };
+
+    inject();
+    return () => {
+      disposed = true;
+      if (retryTimer) window.clearTimeout(retryTimer);
+      // 只移除自己插入的节点，页面卸载后不残留。
+      injectedStyle?.remove();
+      injectedStyle = null;
+    };
   }, []);
 
   useEffect(() => {
@@ -1669,10 +1813,13 @@ function SettingsPage() {
     }
     const nextState = normalizeCloudSaveRestoreState(result.data?.state);
     setCloudSaveRestoreState(nextState);
-    if (Array.isArray(nextState.selected_entry_ids) && nextState.selected_entry_ids.length > 0 && selectedRestoreEntryIds.length === 0) {
-      setSelectedRestoreEntryIds(nextState.selected_entry_ids);
+    // 用函数式 setState 读取当前值，避免把 selectedRestoreEntryIds
+    // 写进依赖导致勾选存档项时整个初始化 effect 重跑、覆盖未保存的草稿。
+    if (Array.isArray(nextState.selected_entry_ids) && nextState.selected_entry_ids.length > 0) {
+      const incoming = nextState.selected_entry_ids;
+      setSelectedRestoreEntryIds((current) => (current.length === 0 ? incoming : current));
     }
-  }, [selectedRestoreEntryIds.length]);
+  }, []);
 
   const refreshRestoreOptions = useCallback(async () => {
     if (loadingRestoreOptions) return;
@@ -2447,6 +2594,7 @@ function Content() {
   const [openingLogin, setOpeningLogin] = useState<boolean>(false);
   const [openingLibrary, setOpeningLibrary] = useState<boolean>(false);
   const [uninstallingKey, setUninstallingKey] = useState<string>("");
+  const [pendingTaskId, setPendingTaskId] = useState<string>("");
   const syncingRef = useRef<boolean>(false);
   const latestStateRef = useRef<PanelState>(EMPTY_STATE);
 
@@ -2602,6 +2750,77 @@ function Content() {
     }
   }, []);
 
+  const runTaskAction = useCallback(
+    async (task: TaskItem, action: "pause" | "resume" | "remove") => {
+      if (pendingTaskId) return;
+      setPendingTaskId(task.task_id);
+      try {
+        let result: ApiResponse<TaskItem> | ApiResponse<Record<string, unknown>>;
+        if (action === "pause") {
+          result = await pauseTianyiTask({ task_id: task.task_id });
+        } else if (action === "resume") {
+          result = await resumeTianyiTask({ task_id: task.task_id });
+        } else {
+          result = await removeTianyiTask({ task_id: task.task_id, delete_files: true });
+        }
+        if (result.status !== "success") {
+          throw new Error(result.message || "任务操作失败");
+        }
+        if (action === "remove") {
+          const removeData = result.data as unknown as { deleted_files?: unknown } | undefined;
+          const deleted = Array.isArray(removeData?.deleted_files);
+          toaster.toast({
+            title: "Freedeck",
+            body: deleted
+              ? `已删除任务及下载文件：${task.game_title || task.file_name}`
+              : `已删除任务：${task.game_title || task.file_name}`,
+          });
+        } else if (action === "resume" && String(task.status || "").toLowerCase() === "error") {
+          toaster.toast({ title: "Freedeck", body: "已重新获取下载链接并开始重试" });
+        }
+        await syncState("active");
+      } catch (error) {
+        toaster.toast({ title: "Freedeck", body: String(error) });
+      } finally {
+        setPendingTaskId("");
+      }
+    },
+    [pendingTaskId, syncState],
+  );
+
+  const onTaskPause = useCallback(
+    (task: TaskItem) => {
+      void runTaskAction(task, "pause");
+    },
+    [runTaskAction],
+  );
+
+  const onTaskResume = useCallback(
+    (task: TaskItem) => {
+      void runTaskAction(task, "resume");
+    },
+    [runTaskAction],
+  );
+
+  const onTaskRemove = useCallback(
+    (task: TaskItem) => {
+      const title = task.game_title || task.game_name || task.file_name || "该任务";
+      showModal(
+        <ConfirmModal
+          strTitle="确认删除"
+          strDescription={`确定删除「${title}」的下载任务吗？\n\n将同时删除已下载的部分文件。`}
+          strOKButtonText="确认删除"
+          strCancelButtonText="取消"
+          onOK={() => {
+            void runTaskAction(task, "remove");
+          }}
+          onCancel={() => {}}
+        />,
+      );
+    },
+    [runTaskAction],
+  );
+
   const installedGames = useMemo(() => state.installed?.preview || [], [state.installed]);
   const installedGameIds = useMemo(() => {
     const set = new Set<string>();
@@ -2737,7 +2956,12 @@ function Content() {
         <PanelSection title={`下载列表（${visibleTasks.length}）`}>
           {visibleTasks.slice(0, 20).map((task) => (
             <PanelSectionRow key={task.task_id}>
-              {TaskProgressRow(task)}
+              {TaskProgressRow(task, {
+                onPause: onTaskPause,
+                onResume: onTaskResume,
+                onRemove: onTaskRemove,
+                pendingTaskId,
+              })}
             </PanelSectionRow>
           ))}
         </PanelSection>
